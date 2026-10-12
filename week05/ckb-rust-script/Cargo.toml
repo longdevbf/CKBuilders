@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "contracts/hello-world",
+    "contracts/simple-print-args",
+    "tests",
+]
+resolver = "2"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+overflow-checks = true
+strip = false
