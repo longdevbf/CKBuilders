@@ -2,18 +2,26 @@
 import { ccc } from "@ckb-ccc/connector-react";
 import { useState } from "react";
 import type { Nft } from "@/app/services/nftService";
+import { requestTx, signAndSend, syncUntil } from "@/app/lib/dexClient";
+import { useAddress } from "./useAddress";
 
-// Button to sell / cancel the sale of a DOB
+// Button to sell / cancel the sale of a DOB.
+// Selling locks the DOB with the DEX contract; cancelling takes it back.
 export function SellDOB({ nft, onDone }: { nft: Nft; onDone: () => void }) {
   const signer = ccc.useSigner();
+  const address = useAddress();
   const [price, setPrice] = useState("");
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const run = async (fn: () => Promise<void>) => {
+  const run = async (fn: (signer: ccc.Signer) => Promise<void>) => {
+    if (!signer || !address) {
+      setStatus("Error: Wallet not connected");
+      return;
+    }
     setBusy(true);
     try {
-      await fn();
+      await fn(signer);
       setStatus("");
       onDone();
     } catch (e) {
@@ -24,43 +32,30 @@ export function SellDOB({ nft, onDone }: { nft: Nft; onDone: () => void }) {
   };
 
   const sell = () =>
-    run(async () => {
-      if (!signer) throw new Error("Wallet not connected");
-      // 1. Get the market's escrow address
-      setStatus("Getting market address...");
-      const market = await (await fetch("/api/market")).json();
-      if (!market.address) throw new Error(market.error ?? "Could not get the market address");
+    run(async (signer) => {
+      // 1. The server builds the DEX order transaction with ckb-dex-sdk
+      setStatus("Building order...");
+      const { rawTx } = await requestTx(nft.id, "list", { seller: address, price });
 
-      // 2. Move the DOB into the escrow wallet (signed by the seller)
-      setStatus("Moving DOB to the market...");
-      const { script: to } = await ccc.Address.fromString(market.address, signer.client);
-      const { tx } = await ccc.spore.transferSpore({ signer, id: nft.sporeId, to });
-      await tx.completeFeeBy(signer);
-      const txHash = await signer.sendTransaction(tx);
-      setStatus("Waiting for transaction to confirm...");
-      await signer.client.waitTransaction(txHash);
+      // 2. The seller signs: the DOB moves into the DEX contract
+      setStatus("Waiting for wallet signature...");
+      await signAndSend(signer, rawTx);
 
-      // 3. The server verifies, then saves the price to the DB
+      // 3. Copy the on-chain order (price, status) into the DB
       setStatus("Listing for sale...");
-      const res = await fetch(`/api/nfts/${nft.id}/list`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ price, txHash }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Listing failed");
+      await syncUntil(nft.id, "listed");
     });
 
   const cancel = () =>
-    run(async () => {
+    run(async (signer) => {
+      setStatus("Building cancel transaction...");
+      const { rawTx } = await requestTx(nft.id, "cancel", { seller: address });
+
+      setStatus("Waiting for wallet signature...");
+      await signAndSend(signer, rawTx);
+
       setStatus("Cancelling listing...");
-      const res = await fetch(`/api/nfts/${nft.id}/cancel`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ owner: nft.owner }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Cancel failed");
+      await syncUntil(nft.id, "owned");
     });
 
   if (nft.status === "listed") {

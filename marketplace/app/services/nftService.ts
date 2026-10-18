@@ -1,6 +1,8 @@
 import { pool } from "@/app/lib/pool";
 
-export type NftStatus = "owned" | "listed" | "selling";
+// "owned"  -> held in a normal wallet
+// "listed" -> locked by the DEX contract, waiting for a buyer
+export type NftStatus = "owned" | "listed";
 
 // NFT info returned to the client (without the file bytes)
 export type Nft = {
@@ -12,7 +14,6 @@ export type Nft = {
   price: string | null; // shannons, as a string because it is a bigint
   status: NftStatus;
   mintTx: string;
-  saleTx: string | null;
 };
 
 type Row = {
@@ -24,11 +25,9 @@ type Row = {
   price: string | null;
   status: NftStatus;
   mint_tx: string;
-  sale_tx: string | null;
 };
 
-const COLUMNS =
-  "id, spore_id, name, content_type, owner, price, status, mint_tx, sale_tx";
+const COLUMNS = "id, spore_id, name, content_type, owner, price, status, mint_tx";
 
 const toNft = (r: Row): Nft => ({
   id: r.id,
@@ -39,7 +38,6 @@ const toNft = (r: Row): Nft => ({
   price: r.price,
   status: r.status,
   mintTx: r.mint_tx,
-  saleTx: r.sale_tx,
 });
 
 let schemaReady: Promise<unknown> | null = null;
@@ -55,7 +53,6 @@ function ensureSchema() {
       price        BIGINT,
       status       TEXT NOT NULL DEFAULT 'owned',
       mint_tx      TEXT NOT NULL,
-      sale_tx      TEXT UNIQUE,
       created_at   TIMESTAMPTZ DEFAULT now()
     )
   `);
@@ -134,39 +131,17 @@ export async function listNfts(filter: {
   return rows.map(toNft);
 }
 
-// Conditional (atomic) status change to prevent two buyers at the same time.
-// Returns the NFT if the change succeeded, null if the current status does not match.
-export async function claimStatus(
+// Copy the on-chain state (owner / listed price) into the DB.
+// The chain is the source of truth, the DB is only a cache for the marketplace page.
+export async function saveChainState(
   id: number,
-  from: NftStatus,
-  to: NftStatus
+  state: { status: NftStatus; owner: string; price: bigint | null }
 ): Promise<Nft | null> {
   await ensureSchema();
   const { rows } = await pool.query<Row>(
-    `UPDATE nfts SET status = $3 WHERE id = $1 AND status = $2
+    `UPDATE nfts SET status = $2, owner = $3, price = $4 WHERE id = $1
      RETURNING ${COLUMNS}`,
-    [id, from, to]
+    [id, state.status, state.owner, state.price === null ? null : state.price.toString()]
   );
   return rows[0] ? toNft(rows[0]) : null;
-}
-
-export async function markListed(id: number, priceShannons: bigint) {
-  await ensureSchema();
-  await pool.query(
-    "UPDATE nfts SET status = 'listed', price = $2 WHERE id = $1",
-    [id, priceShannons.toString()]
-  );
-}
-
-export async function markOwned(
-  id: number,
-  owner: string,
-  saleTx: string | null
-) {
-  await ensureSchema();
-  await pool.query(
-    `UPDATE nfts SET status = 'owned', price = NULL, owner = $2, sale_tx = $3
-     WHERE id = $1`,
-    [id, owner, saleTx]
-  );
 }
